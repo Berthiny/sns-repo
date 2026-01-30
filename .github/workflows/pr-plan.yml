@@ -1,0 +1,122 @@
+name: Terraform PR (Plan)
+
+on:
+  pull_request:
+    branches: [ "main" ]
+    types: [ opened, reopened, ready_for_review, synchronize ]
+
+permissions:
+  contents: read
+  pull-requests: write   # needed to comment on PR
+  id-token: write        # OIDC -> AWS
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.8.5
+
+      - name: Prep plugin cache
+        run: mkdir -p ~/.terraform.d/plugin-cache
+
+      - name: Find Terraform directories
+        id: find
+        run: |
+          set -euo pipefail
+          mapfile -t DIRS < <(git ls-files -z '*.tf' | xargs -0 -n1 dirname | sort -u)
+          if [ ${#DIRS[@]} -eq 0 ]; then
+            echo "dirs=[]" >> $GITHUB_OUTPUT
+          else
+            JSON=$(printf '%s\n' "${DIRS[@]}" | jq -R -s -c 'split("\n")[:-1]')
+            echo "dirs=$JSON" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run Terraform plan
+        id: plan
+        if: steps.find.outputs.dirs != '[]'
+        run: |
+          set -euo pipefail
+          SUMMARY=""
+          for d in $(echo '${{ steps.find.outputs.dirs }}' | jq -r '.[]'); do
+            echo "=== Planning $d ==="
+            pushd "$d" >/dev/null
+
+            if [ "$d" = "." ]; then
+              KEY_SUFFIX="root/terraform.tfstate"
+            else
+              KEY_SUFFIX="$d/terraform.tfstate"
+            fi
+            KEY="${GITHUB_REPOSITORY}/${KEY_SUFFIX}"
+
+            terraform init -input=false -upgrade -reconfigure
+
+            terraform validate
+
+            set +e
+            PLAN_OUT=$(terraform plan -input=false -no-color)
+            CODE=$?
+            set -e
+
+            SUMMARY+="\n### 📂 Directory: \`$d\`\n"
+            SUMMARY+="\n<details><summary>Show Plan</summary>\n\n\`\`\`hcl\n${PLAN_OUT}\n\`\`\`\n</details>\n"
+
+            if [ $CODE -eq 1 ]; then
+              echo "Plan failed in $d"; exit 1
+            fi
+
+            popd >/dev/null
+          done
+          echo -e "$SUMMARY" > plan_summary.md
+          echo "summary-file=plan_summary.md" >> $GITHUB_OUTPUT
+
+      # 🛡 Security: tfsec scan + comment directly on PR
+      - name: Run tfsec & Comment on PR
+        uses: aquasecurity/tfsec-pr-commenter-action@v1.0.3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          tfsec_args: --soft-fail  # don’t block merges, just report
+
+      # 🛡 Best Practices: TFLint
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: v0.51.1
+
+      - name: Run TFLint per directory
+        if: steps.find.outputs.dirs != '[]'
+        run: |
+          for d in $(echo '${{ steps.find.outputs.dirs }}' | jq -r '.[]'); do
+            echo "=== TFLint $d ==="
+            tflint --chdir="$d" --disable-rule=terraform_unused_declarations || true
+          done
+
+      # 💬 Post Terraform plan summary as PR comment
+      - name: Comment plan on PR
+        if: steps.find.outputs.dirs != '[]'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const summary = fs.readFileSync('${{ steps.plan.outputs.summary-file }}', 'utf8');
+            const body = `## 📝 Terraform Plan Results\n${summary}`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });
