@@ -1,0 +1,72 @@
+name: Terraform Destroy
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "destroy" to confirm destruction of resources'
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: us-east-1
+  
+
+jobs:
+  destroy:
+    runs-on: ubuntu-latest
+    if: github.event.inputs.confirm == 'destroy'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.8.5
+
+      - name: Prep plugin cache
+        run: mkdir -p ~/.terraform.d/plugin-cache
+
+      - name: Find Terraform directories
+        id: find
+        run: |
+          set -euo pipefail
+          mapfile -t DIRS < <(git ls-files -z '*.tf' | xargs -0 -n1 dirname | sort -u)
+          if [ ${#DIRS[@]} -eq 0 ]; then
+            echo "dirs=[]" >> $GITHUB_OUTPUT
+          else
+            JSON=$(printf '%s\n' "${DIRS[@]}" | jq -R -s -c 'split("\n")[:-1]')
+            echo "dirs=$JSON" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Destroy each directory
+        if: steps.find.outputs.dirs != '[]'
+        run: |
+          set -euo pipefail
+          for d in $(echo '${{ steps.find.outputs.dirs }}' | jq -r '.[]'); do
+            echo "=== Destroying $d ==="
+            pushd "$d" >/dev/null
+
+            if [ "$d" = "." ]; then
+              KEY_SUFFIX="root/terraform.tfstate"
+            else
+              KEY_SUFFIX="$d/terraform.tfstate"
+            fi
+            KEY="${GITHUB_REPOSITORY}/${KEY_SUFFIX}"
+
+            terraform init -input=false -upgrade -reconfigure
+
+            echo "⚠️ Destroying resources in $d"
+            terraform destroy -input=false -auto-approve
+
+            popd >/dev/null
+
+          done
