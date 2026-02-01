@@ -1,3 +1,3 @@
 resource "aws_sns_topic" "example" {
-    name = var.topic_name
+  name = var.topic_name
 }

@@ -24,5 +24,5 @@ provider "aws" {
     tags = {
       ManagedBy = "Terraform"
     }
-}
+  }
 }
